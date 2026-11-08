@@ -8,7 +8,6 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import persistence_utils as pu  # noqa: E402
 from security import (  # noqa: E402
-    MAX_REPLY_CHARS,
     UNTRUSTED_NOTICE,
     BearerAuthMiddleware,
     UnsafeURLError,
@@ -75,7 +74,8 @@ def test_wrap_marks_reply_and_passes_text_through():
     assert re.match(r"<<UNTRUSTED_AGENT_REPLY id=[0-9a-f]{16} source=https://a.example>>\n", out)
 
 def test_nonce_is_unpredictable_and_closing_marker_matches():
-    a = wrap_untrusted_text("x", "u"); b = wrap_untrusted_text("x", "u")
+    a = wrap_untrusted_text("x", "u")
+    b = wrap_untrusted_text("x", "u")
     ida = re.search(r"id=([0-9a-f]+)", a).group(1)
     assert ida != re.search(r"id=([0-9a-f]+)", b).group(1)
     assert a.endswith(f"<<END_UNTRUSTED_AGENT_REPLY id={ida}>>")
