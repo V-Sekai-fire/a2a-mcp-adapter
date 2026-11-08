@@ -519,3 +519,10 @@ The code in the `common/` directory is from the [Google A2A project](https://git
 - Anthropic for the [Model Context Protocol](https://modelcontextprotocol.io/)
 - Google for the [Agent-to-Agent Protocol](https://github.com/google/A2A)
 - Contributors to the FastMCP library
+
+## Security configuration
+
+- `MCP_HOST` and `A2A_HOST` default to `127.0.0.1`. Binding a non-loopback host for `streamable-http` or `sse` requires `A2A_MCP_AUTH_TOKEN`; clients send `Authorization: Bearer <token>`. Stdio mode is unaffected.
+- `register_agent` only fetches http/https URLs whose host resolves to public addresses (no loopback, private, link-local or metadata ranges) and does not follow redirects. Set `A2A_ALLOW_PRIVATE_AGENTS=1` to allow local agents.
+- Persisted agent files are written atomically with mode 0600, size-capped on load, and each stored URL is re-validated at startup.
+- `requirements.lock` pins dependencies; the Docker image runs as a non-root user with data in `/data`.
