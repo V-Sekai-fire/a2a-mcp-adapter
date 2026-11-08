@@ -378,6 +378,17 @@ The server exposes the following MCP tools for integration with LLMs like Claude
   }
   ```
 
+## Untrusted agent replies (prompt injection)
+
+Registration is gated, but a registered agent can still be compromised or hostile. Every string
+an agent returns (message text, artifact names and contents, task history, data parts, error
+messages) is wrapped as `<<UNTRUSTED_AGENT_REPLY source=...>> ... <<END_UNTRUSTED_AGENT_REPLY>>`
+before it reaches the MCP client's model. Control characters are stripped, the `<<`/`>>`
+delimiters are neutralized so a reply cannot close its own envelope, and each reply is capped at
+20,000 characters. Responses carry an `untrusted_content` notice saying the contents are data,
+not instructions. Raw replies are no longer written to the MCP log. Client agents must still
+not act on directions found inside an envelope.
+
 ## Usage Examples
 
 ### Basic Workflow

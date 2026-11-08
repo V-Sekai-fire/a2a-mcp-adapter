@@ -55,8 +55,11 @@ from common.server.task_manager import InMemoryTaskManager
 from persistence_utils import save_to_json, load_from_json
 from security import (
     BearerAuthMiddleware,
+    UNTRUSTED_NOTICE,
     UnsafeURLError,
     require_auth_for_host,
+    wrap_untrusted_data,
+    wrap_untrusted_text,
     validate_agent_url,
 )
 
@@ -484,12 +487,13 @@ async def send_message(
         
         # Debug: Print the raw response for analysis
         if ctx:
-            await ctx.info(f"Raw response: {result}")
+            await ctx.info("Received response from agent")
             
         # Create a response dictionary with as much info as we can extract
         response = {
             "status": "success",
             "task_id": task_id,
+            "untrusted_content": UNTRUSTED_NOTICE,
         }
         
         # Add any available fields from the result
@@ -515,7 +519,7 @@ async def send_message(
                     if part.type == "text":
                         response_text += part.text
                 if response_text:
-                    response["message"] = response_text
+                    response["message"] = wrap_untrusted_text(response_text, agent_url)
         except Exception as e:
             response["message_error"] = f"Error extracting message: {str(e)}"
         
@@ -525,7 +529,7 @@ async def send_message(
                 artifacts_data = []
                 for artifact in result.artifacts:
                     artifact_data = {
-                        "name": artifact.name if hasattr(artifact, "name") else "unnamed_artifact",
+                        "name": wrap_untrusted_text(artifact.name if hasattr(artifact, "name") else "unnamed_artifact", agent_url),
                         "contents": [],
                     }
                     
@@ -533,12 +537,12 @@ async def send_message(
                         if part.type == "text":
                             artifact_data["contents"].append({
                                 "type": "text",
-                                "text": part.text,
+                                "text": wrap_untrusted_text(part.text, agent_url),
                             })
                         elif part.type == "data":
                             artifact_data["contents"].append({
                                 "type": "data",
-                                "data": part.data,
+                                "data": wrap_untrusted_data(part.data, agent_url),
                             })
                     
                     artifacts_data.append(artifact_data)
@@ -597,12 +601,13 @@ async def get_task_result(
         
         # Debug: Print the raw response for analysis
         if ctx:
-            await ctx.info(f"Raw task result: {result}")
+            await ctx.info("Received task result from agent")
             
         # Create a response dictionary with as much info as we can extract
         response = {
             "status": "success",
             "task_id": task_id,
+            "untrusted_content": UNTRUSTED_NOTICE,
         }
         
         # Try to extract task data
@@ -629,14 +634,14 @@ async def get_task_result(
                             if part.type == "text":
                                 response_text += part.text
                         if response_text:
-                            response["message"] = response_text
+                            response["message"] = wrap_untrusted_text(response_text, agent_url)
                 
                 # Extract artifacts
                 if hasattr(task, "artifacts") and task.artifacts:
                     artifacts_data = []
                     for artifact in task.artifacts:
                         artifact_data = {
-                            "name": artifact.name if hasattr(artifact, "name") else "unnamed_artifact",
+                            "name": wrap_untrusted_text(artifact.name if hasattr(artifact, "name") else "unnamed_artifact", agent_url),
                             "contents": [],
                         }
                         
@@ -644,12 +649,12 @@ async def get_task_result(
                             if part.type == "text":
                                 artifact_data["contents"].append({
                                     "type": "text",
-                                    "text": part.text,
+                                    "text": wrap_untrusted_text(part.text, agent_url),
                                 })
                             elif part.type == "data":
                                 artifact_data["contents"].append({
                                     "type": "data",
-                                    "data": part.data,
+                                    "data": wrap_untrusted_data(part.data, agent_url),
                                 })
                         
                         artifacts_data.append(artifact_data)
@@ -669,12 +674,12 @@ async def get_task_result(
                             if part.type == "text":
                                 message_data["parts"].append({
                                     "type": "text",
-                                    "text": part.text,
+                                    "text": wrap_untrusted_text(part.text, agent_url),
                                 })
                             elif hasattr(part, "data"):
                                 message_data["parts"].append({
                                     "type": "data",
-                                    "data": part.data,
+                                    "data": wrap_untrusted_data(part.data, agent_url),
                                 })
                         
                         history_data.append(message_data)
@@ -733,14 +738,14 @@ async def cancel_task(
         
         # Debug: Print the raw response for analysis
         if ctx:
-            await ctx.info(f"Raw cancellation result: {result}")
+            await ctx.info("Received cancellation result from agent")
             
         # Create a response dictionary
         if hasattr(result, "error"):
             return {
                 "status": "error",
                 "task_id": task_id,
-                "message": result.error.message,
+                "message": wrap_untrusted_text(result.error.message, agent_url),
                 "code": result.error.code
             }
         elif hasattr(result, "result"):
@@ -817,6 +822,7 @@ async def send_message_stream(
         complete_response = {
             "status": "success",
             "task_id": task_id,
+            "untrusted_content": UNTRUSTED_NOTICE,
             "session_id": session_id,
             "state": "working",
             "messages": [],
@@ -862,9 +868,10 @@ async def send_message_stream(
                                     message_text += part.text
                             
                             if message_text:
+                                message_text = wrap_untrusted_text(message_text, agent_url)
                                 complete_response["messages"].append(message_text)
                                 if ctx:
-                                    await ctx.info(f"Agent: {message_text}")
+                                    await ctx.info("Agent sent a message")
                         
                         # If this is the final event, set session ID
                         if hasattr(status_event, "final") and status_event.final:
@@ -876,7 +883,7 @@ async def send_message_stream(
                         
                         # Extract artifact content
                         artifact_data = {
-                            "name": artifact_event.artifact.name if hasattr(artifact_event.artifact, "name") else "unnamed",
+                            "name": wrap_untrusted_text(artifact_event.artifact.name if hasattr(artifact_event.artifact, "name") else "unnamed", agent_url),
                             "contents": [],
                         }
                         
@@ -884,12 +891,12 @@ async def send_message_stream(
                             if part.type == "text":
                                 artifact_data["contents"].append({
                                     "type": "text",
-                                    "text": part.text,
+                                    "text": wrap_untrusted_text(part.text, agent_url),
                                 })
                             elif part.type == "data":
                                 artifact_data["contents"].append({
                                     "type": "data",
-                                    "data": part.data,
+                                    "data": wrap_untrusted_data(part.data, agent_url),
                                 })
                         
                         complete_response["artifacts"].append(artifact_data)
