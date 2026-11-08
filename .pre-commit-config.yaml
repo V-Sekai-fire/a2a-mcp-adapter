@@ -1,0 +1,25 @@
+# Hygiene hooks cover only files this fork owns, so upstream code is not rewritten.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: end-of-file-fixer
+        files: ^(security\.py|persistence_utils\.py|tests/|Dockerfile|\.pre-commit-config\.yaml|\.github/)
+      - id: trailing-whitespace
+        files: ^(security\.py|persistence_utils\.py|tests/|Dockerfile|\.pre-commit-config\.yaml|\.github/)
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.6
+    hooks:
+      - id: ruff
+        files: ^(security\.py|tests/)
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest
+        language: system
+        entry: uv run --python 3.11 --with-requirements requirements.lock --with pytest pytest -q tests
+        pass_filenames: false
+        always_run: true
