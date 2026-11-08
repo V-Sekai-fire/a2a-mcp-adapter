@@ -428,7 +428,7 @@ async def unregister_agent(url: str, ctx: Context = None) -> Dict[str, Any]:
         }
 
 
-@mcp.tool()
+@mcp.tool(annotations={"openWorldHint": True})
 async def send_message(
     agent_url: str,
     message: str,
@@ -559,7 +559,7 @@ async def send_message(
         }
 
 
-@mcp.tool()
+@mcp.tool(annotations={"openWorldHint": True})
 async def get_task_result(
     task_id: str,
     history_length: Optional[int] = None,
@@ -768,7 +768,7 @@ async def cancel_task(
         }
 
 
-@mcp.tool()
+@mcp.tool(annotations={"openWorldHint": True})
 async def send_message_stream(
     agent_url: str,
     message: str,
