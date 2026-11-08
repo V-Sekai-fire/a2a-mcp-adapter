@@ -53,6 +53,8 @@ build-backend = "hatchling.build"
 include = [
     "a2a_mcp_server.py",
     "persistence_utils.py",
+    "security.py",
+    "a2a_v1.py",
     "common/**/*.py",
 ]
 

@@ -387,8 +387,28 @@ The MCP tools (`register_agent`, `send_message`, `send_message_stream`, `get_tas
 parts without a `kind` field. Agents are discovered at `/.well-known/agent-card.json` and must
 list a `JSONRPC` interface with protocol version 1.x in `supportedInterfaces`; the interface URL
 goes through the same SSRF guard as the registered URL. Agents that only speak the old
-`tasks/send` dialect are no longer supported by the tools. The bridge's own A2A server side
-(`setup_a2a_server`) is unchanged and still uses the old dialect.
+`tasks/send` dialect are no longer supported by the tools. The bridge's own A2A server side also speaks v1.0 (see below).
+
+## A2A server (v1.0)
+
+The bridge can also act as an A2A v1.0 agent, so A2A clients can reach registered agents through it.
+It is off by default; set `A2A_SERVER=1` to listen on `A2A_HOST:A2A_PORT` (default `127.0.0.1:41241`).
+Set `A2A_PUBLIC_URL` when the card should advertise a different address.
+
+- Card: `GET /.well-known/agent-card.json`, public so clients can discover the bearer scheme.
+- JSON-RPC at `POST /`: `SendMessage`, `SendStreamingMessage`, `GetTask`, `ListTasks`, `CancelTask`,
+  `SubscribeToTask`. Push-notification config answers `-32003`, `GetExtendedAgentCard` answers `-32004`.
+  A missing or non-1.x `A2A-Version` header answers `VersionNotSupportedError` (`-32009`); the 0.3
+  default for an empty header is not honored.
+- Binding to a non-loopback `A2A_HOST` requires `A2A_MCP_AUTH_TOKEN`; the JSON-RPC endpoint then
+  needs `Authorization: Bearer ...`. One token means one principal, so task access scoping (spec 13.1)
+  is trivially satisfied.
+- Forwarding target: `metadata.agent_url` on the first `SendMessage` must be a registered agent. The
+  bridge mints its own task ids and maps them to (agent, remote id); callers never see or send remote ids.
+  The map is in memory, capped at 1000 tasks, and not written to the JSON files.
+- Messages, tasks and events are rebuilt from a field whitelist with size caps (spec 13.4). Upstream
+  error text is logged, not returned. The untrusted-reply envelope is not applied on the A2A wire,
+  because the consumer is an A2A client, not an LLM context.
 
 ## Untrusted agent replies (prompt injection)
 
@@ -519,18 +539,16 @@ To add new capabilities to the server, add methods decorated with `@mcp.tool()` 
 
 ### Custom Task Manager
 
-The server uses a custom `A2AServerTaskManager` class that extends `InMemoryTaskManager`. You can customize its behavior by modifying this class.
+The A2A server side uses `BridgeTaskManager` in `common/server/task_manager.py`.
 
 ## Project Structure
 
 ```
 a2a-mcp-server/
 ├── a2a_mcp_server.py      # Main server implementation
-├── common/                # A2A protocol code (from google/A2A)
-│   ├── client/            # A2A client implementation
-│   ├── server/            # A2A server implementation
-│   ├── types.py           # Common type definitions
-│   └── utils/             # Utility functions
+├── a2a_v1.py              # A2A v1.0 client and reply rendering
+├── security.py            # SSRF guard, bearer auth, untrusted-reply envelope
+├── common/server/         # A2A v1.0 server and bridge task manager
 ├── config_creator.py      # Script to help create Claude Desktop configuration
 ├── .gitignore             # Git ignore file
 ├── pyproject.toml         # Project metadata and dependencies
