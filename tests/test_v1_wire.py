@@ -118,3 +118,19 @@ def test_agent_error_text_wrapped(monkeypatch):
     out = call(srv.send_message, agent_url=BASE, message="x")
     assert out["status"] == "error"
     assert_all_wrapped(out)
+
+
+def test_mcp_client_roundtrip_keeps_envelope():
+    from fastmcp import Client
+
+    async def go():
+        async with Client(srv.mcp) as c:
+            tools = {t.name: t for t in await c.list_tools()}
+            hints = {n: bool(t.annotations and t.annotations.openWorldHint) for n, t in tools.items()}
+            res = await c.call_tool("send_message", {"agent_url": BASE, "message": "hi"})
+            return hints, res.data if res.data is not None else res.structured_content
+    hints, data = asyncio.run(go())
+    assert hints["send_message"] and hints["get_task_result"] and hints["send_message_stream"]
+    assert not hints["cancel_task"]
+    assert data["status"] == "success"
+    assert_all_wrapped(data)
