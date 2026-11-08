@@ -53,6 +53,17 @@ from common.types import (
 from common.client.client import A2AClient
 from common.server.task_manager import InMemoryTaskManager
 from persistence_utils import save_to_json, load_from_json
+from a2a_v1 import (
+    A2AError,
+    error_text,
+    fetch_card,
+    make_client,
+    pick_interface,
+    render_send_result,
+    render_stream_event,
+    render_task,
+    MAX_STREAM_EVENTS,
+)
 from security import (
     BearerAuthMiddleware,
     UNTRUSTED_NOTICE,
@@ -269,57 +280,14 @@ class A2ABridgeTaskManager(InMemoryTaskManager):
             )
             await self.enqueue_events_for_sse(task_id, error_event)
 
-async def fetch_agent_card(url: str) -> AgentCard:
-    """
-    Fetch the agent card from the agent's URL.
-    First try the main URL, then the well-known location.
-    """
+async def fetch_agent_card(url: str) -> Dict[str, Any]:
+    """Fetch and validate a v1.0 agent card (SSRF-guarded); raises ValueError."""
     try:
-        url = await asyncio.to_thread(validate_agent_url, url)
-    except UnsafeURLError as e:
-        raise ValueError(f"Refusing to fetch agent card: {e}")
-    # follow_redirects stays off so a public host cannot bounce us to an internal one
-    async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
-        # First try the main endpoint
-        try:
-            response = await client.get(url)
-            if response.status_code == 200:
-                try:
-                    data = response.json()
-                    if isinstance(data, dict) and "name" in data and "url" in data:
-                        return AgentCard(**data)
-                except json.JSONDecodeError:
-                    pass  # Not a valid JSON response, try the well-known URL
-        except Exception:
-            pass  # Connection error, try the well-known URL
-        
-        # Try the well-known location
-        well_known_url = f"{url.rstrip('/')}/.well-known/agent.json"
-        try:
-            response = await client.get(well_known_url)
-            if response.status_code == 200:
-                try:
-                    data = response.json()
-                    return AgentCard(**data)
-                except json.JSONDecodeError:
-                    raise ValueError(f"Invalid JSON in agent card from {well_known_url}")
-        except httpx.RequestError as e:
-            raise ValueError(f"Failed to fetch agent card from {well_known_url}: {str(e)}")
-    
-    # If we can't get the agent card, create a minimal one with default values
-    return AgentCard(
-        name="Unknown Agent",
-        url=url,
-        version="0.1.0",
-        capabilities=AgentCapabilities(streaming=False),
-        skills=[
-            AgentSkill(
-                id="unknown",
-                name="Unknown Skill",
-                description="Unknown agent capabilities",
-            )
-        ],
-    )
+        card = await fetch_card(url)
+        pick_interface(card)
+        return card
+    except A2AError as e:
+        raise ValueError(str(e))
 
 
 @mcp.tool()
@@ -340,8 +308,8 @@ async def register_agent(url: str, ctx: Context) -> Dict[str, Any]:
         # Store the agent information
         agent_info = AgentInfo(
             url=url,
-            name=agent_card.name,
-            description=agent_card.description or "No description provided",
+            name=str(agent_card.get("name"))[:200],
+            description=str(agent_card.get("description") or "No description provided")[:2000],
         )
         
         registered_agents[url] = agent_info
@@ -350,7 +318,7 @@ async def register_agent(url: str, ctx: Context) -> Dict[str, Any]:
         agents_data = {url: agent.model_dump() for url, agent in registered_agents.items()}
         save_to_json(agents_data, REGISTERED_AGENTS_FILE)
         
-        await ctx.info(f"Successfully registered agent: {agent_card.name}")
+        await ctx.info(f"Successfully registered agent: {agent_info.name}")
         return {
             "status": "success",
             "agent": agent_info.model_dump(),
@@ -436,127 +404,31 @@ async def send_message(
     ctx: Context = None,
 ) -> Dict[str, Any]:
     """
-    Send a message to an A2A agent.
-    
+    Send a message to an A2A (v1.0) agent.
+
     Args:
         agent_url: URL of the A2A agent
         message: Message to send
-        session_id: Optional session ID for multi-turn conversations
-        
+        session_id: Optional A2A contextId for multi-turn conversations
+
     Returns:
-        Agent's response with task_id for future reference
+        Agent's response (task or message). All agent text is wrapped as untrusted.
     """
     if agent_url not in registered_agents:
-        return {
-            "status": "error",
-            "message": f"Agent not registered: {agent_url}",
-        }
-    
-    # Create a client for the agent
-    client = A2AClient(url=agent_url)
-    
+        return {"status": "error", "message": f"Agent not registered: {agent_url}"}
     try:
-        # Generate a task ID
-        task_id = str(uuid.uuid4())
-        
-        # Store the mapping of task_id to agent_url for later reference
-        task_agent_mapping[task_id] = agent_url
-        
-        # Create the message
-        a2a_message = Message(
-            role="user",
-            parts=[TextPart(text=message)],
-        )
-        
         if ctx:
-            await ctx.info(f"Sending message to agent: {message}")
-        
-        # Create payload as a single dictionary
-        payload = {
-            "id": task_id,
-            "message": a2a_message,
-        }
-        if session_id:
-            payload["sessionId"] = session_id
-        
-        # Send the task with the payload
-        result = await client.send_task(payload)
-        
-        # Save task mapping to disk
-        save_to_json(task_agent_mapping, TASK_AGENT_MAPPING_FILE)
-        
-        # Debug: Print the raw response for analysis
+            await ctx.info("Sending message to agent")
+        result = await make_client(agent_url).send_message(message, context_id=session_id)
+        rendered = render_send_result(result, agent_url)
+        if rendered.get("task_id"):
+            task_agent_mapping[rendered["task_id"]] = agent_url
+            save_to_json(task_agent_mapping, TASK_AGENT_MAPPING_FILE)
         if ctx:
             await ctx.info("Received response from agent")
-            
-        # Create a response dictionary with as much info as we can extract
-        response = {
-            "status": "success",
-            "task_id": task_id,
-            "untrusted_content": UNTRUSTED_NOTICE,
-        }
-        
-        # Add any available fields from the result
-        if hasattr(result, "sessionId"):
-            response["session_id"] = result.sessionId
-        else:
-            response["session_id"] = None
-            
-        # Try to get the state
-        try:
-            if hasattr(result, "status") and hasattr(result.status, "state"):
-                response["state"] = result.status.state
-            else:
-                response["state"] = "unknown"
-        except Exception as e:
-            response["state"] = f"error_getting_state: {str(e)}"
-            
-        # Try to extract response message
-        try:
-            if hasattr(result, "status") and hasattr(result.status, "message") and result.status.message:
-                response_text = ""
-                for part in result.status.message.parts:
-                    if part.type == "text":
-                        response_text += part.text
-                if response_text:
-                    response["message"] = wrap_untrusted_text(response_text, agent_url)
-        except Exception as e:
-            response["message_error"] = f"Error extracting message: {str(e)}"
-        
-        # Try to get artifacts
-        try:
-            if hasattr(result, "artifacts") and result.artifacts:
-                artifacts_data = []
-                for artifact in result.artifacts:
-                    artifact_data = {
-                        "name": wrap_untrusted_text(artifact.name if hasattr(artifact, "name") else "unnamed_artifact", agent_url),
-                        "contents": [],
-                    }
-                    
-                    for part in artifact.parts:
-                        if part.type == "text":
-                            artifact_data["contents"].append({
-                                "type": "text",
-                                "text": wrap_untrusted_text(part.text, agent_url),
-                            })
-                        elif part.type == "data":
-                            artifact_data["contents"].append({
-                                "type": "data",
-                                "data": wrap_untrusted_data(part.data, agent_url),
-                            })
-                    
-                    artifacts_data.append(artifact_data)
-                
-                response["artifacts"] = artifacts_data
-        except Exception as e:
-            response["artifacts_error"] = f"Error extracting artifacts: {str(e)}"
-            
-        return response
+        return {"status": "success", "untrusted_content": UNTRUSTED_NOTICE, "session_id": rendered.get("context_id"), **rendered}
     except Exception as e:
-        return {
-            "status": "error",
-            "message": f"Error sending message: {str(e)}",
-        }
+        return {"status": "error", "message": f"Error sending message: {error_text(e, agent_url)}"}
 
 
 @mcp.tool(annotations={"openWorldHint": True})
@@ -566,137 +438,28 @@ async def get_task_result(
     ctx: Context = None,
 ) -> Dict[str, Any]:
     """
-    Retrieve the result of a task from an A2A agent.
-    
+    Get the current state of a task started through send_message.
+
     Args:
-        task_id: ID of the task to retrieve
-        history_length: Optional number of history items to include (null for all)
-        
+        task_id: ID of the task
+        history_length: Optional number of recent history messages to include
+
     Returns:
-        Task result including status, message, and artifacts if available
+        Task state, message, artifacts and history. All agent text is wrapped as untrusted.
     """
     if task_id not in task_agent_mapping:
-        return {
-            "status": "error",
-            "message": f"Task ID not found: {task_id}",
-        }
-    
+        return {"status": "error", "message": f"Task ID not found: {task_id}"}
     agent_url = task_agent_mapping[task_id]
-    
-    # Create a client for the agent
-    client = A2AClient(url=agent_url)
-    
     try:
-        # Create the request payload
-        payload = {
-            "id": task_id,
-            "historyLength": history_length
-        }
-        
         if ctx:
             await ctx.info(f"Retrieving task result for task_id: {task_id}")
-        
-        # Send the get task request
-        result = await client.get_task(payload)
-        
-        # Debug: Print the raw response for analysis
+        task = await make_client(agent_url).get_task(task_id, history_length)
         if ctx:
             await ctx.info("Received task result from agent")
-            
-        # Create a response dictionary with as much info as we can extract
-        response = {
-            "status": "success",
-            "task_id": task_id,
-            "untrusted_content": UNTRUSTED_NOTICE,
-        }
-        
-        # Try to extract task data
-        try:
-            if hasattr(result, "result"):
-                task = result.result
-                
-                # Add basic task info
-                if hasattr(task, "sessionId"):
-                    response["session_id"] = task.sessionId
-                else:
-                    response["session_id"] = None
-                
-                # Add task status
-                if hasattr(task, "status"):
-                    status = task.status
-                    if hasattr(status, "state"):
-                        response["state"] = status.state
-                    
-                    # Extract message from status
-                    if hasattr(status, "message") and status.message:
-                        response_text = ""
-                        for part in status.message.parts:
-                            if part.type == "text":
-                                response_text += part.text
-                        if response_text:
-                            response["message"] = wrap_untrusted_text(response_text, agent_url)
-                
-                # Extract artifacts
-                if hasattr(task, "artifacts") and task.artifacts:
-                    artifacts_data = []
-                    for artifact in task.artifacts:
-                        artifact_data = {
-                            "name": wrap_untrusted_text(artifact.name if hasattr(artifact, "name") else "unnamed_artifact", agent_url),
-                            "contents": [],
-                        }
-                        
-                        for part in artifact.parts:
-                            if part.type == "text":
-                                artifact_data["contents"].append({
-                                    "type": "text",
-                                    "text": wrap_untrusted_text(part.text, agent_url),
-                                })
-                            elif part.type == "data":
-                                artifact_data["contents"].append({
-                                    "type": "data",
-                                    "data": wrap_untrusted_data(part.data, agent_url),
-                                })
-                        
-                        artifacts_data.append(artifact_data)
-                    
-                    response["artifacts"] = artifacts_data
-                
-                # Extract message history if available
-                if hasattr(task, "history") and task.history:
-                    history_data = []
-                    for message in task.history:
-                        message_data = {
-                            "role": message.role,
-                            "parts": [],
-                        }
-                        
-                        for part in message.parts:
-                            if part.type == "text":
-                                message_data["parts"].append({
-                                    "type": "text",
-                                    "text": wrap_untrusted_text(part.text, agent_url),
-                                })
-                            elif hasattr(part, "data"):
-                                message_data["parts"].append({
-                                    "type": "data",
-                                    "data": wrap_untrusted_data(part.data, agent_url),
-                                })
-                        
-                        history_data.append(message_data)
-                    
-                    response["history"] = history_data
-            else:
-                response["error"] = "No result in response"
-                
-        except Exception as e:
-            response["parsing_error"] = f"Error parsing task result: {str(e)}"
-            
-        return response
+        rendered = render_task(task, agent_url)
+        return {"status": "success", "untrusted_content": UNTRUSTED_NOTICE, "session_id": rendered.get("context_id"), **rendered}
     except Exception as e:
-        return {
-            "status": "error",
-            "message": f"Error retrieving task result: {str(e)}",
-        }
+        return {"status": "error", "message": f"Error retrieving task result: {error_text(e, agent_url)}"}
 
 
 @mcp.tool()
@@ -706,66 +469,20 @@ async def cancel_task(
 ) -> Dict[str, Any]:
     """
     Cancel a running task on an A2A agent.
-    
+
     Args:
         task_id: ID of the task to cancel
-        
-    Returns:
-        Cancellation result
     """
     if task_id not in task_agent_mapping:
-        return {
-            "status": "error",
-            "message": f"Task ID not found: {task_id}",
-        }
-    
+        return {"status": "error", "message": f"Task ID not found: {task_id}"}
     agent_url = task_agent_mapping[task_id]
-    
-    # Create a client for the agent
-    client = A2AClient(url=agent_url)
-    
     try:
-        # Create the request payload
-        payload = {
-            "id": task_id
-        }
-        
         if ctx:
             await ctx.info(f"Cancelling task: {task_id}")
-        
-        # Send the cancel task request
-        result = await client.cancel_task(payload)
-        
-        # Debug: Print the raw response for analysis
-        if ctx:
-            await ctx.info("Received cancellation result from agent")
-            
-        # Create a response dictionary
-        if hasattr(result, "error"):
-            return {
-                "status": "error",
-                "task_id": task_id,
-                "message": wrap_untrusted_text(result.error.message, agent_url),
-                "code": result.error.code
-            }
-        elif hasattr(result, "result"):
-            return {
-                "status": "success",
-                "task_id": task_id,
-                "message": "Task cancelled successfully"
-            }
-        else:
-            return {
-                "status": "unknown",
-                "task_id": task_id,
-                "message": "Unexpected response format"
-            }
-            
+        task = await make_client(agent_url).cancel_task(task_id)
+        return {"status": "success", "task_id": task_id, "state": render_task(task, agent_url, history=False).get("state")}
     except Exception as e:
-        return {
-            "status": "error",
-            "message": f"Error cancelling task: {str(e)}",
-        }
+        return {"status": "error", "task_id": task_id, "message": f"Error cancelling task: {error_text(e, agent_url)}"}
 
 
 @mcp.tool(annotations={"openWorldHint": True})
@@ -776,162 +493,42 @@ async def send_message_stream(
     ctx: Context = None,
 ) -> Dict[str, Any]:
     """
-    Send a message to an A2A agent and stream the response.
-    
+    Send a message to an A2A (v1.0) agent and collect the streamed events.
+
     Args:
         agent_url: URL of the A2A agent
         message: Message to send
-        session_id: Optional session ID for multi-turn conversations
-        
+        session_id: Optional A2A contextId for multi-turn conversations
+
     Returns:
-        Stream of agent's responses
+        The collected events. All agent text is wrapped as untrusted.
     """
     if agent_url not in registered_agents:
-        return {
-            "status": "error",
-            "message": f"Agent not registered: {agent_url}",
-        }
-    
-    # Create a client for the agent
-    client = A2AClient(url=agent_url)
-    
+        return {"status": "error", "message": f"Agent not registered: {agent_url}"}
+    events: List[Dict[str, Any]] = []
+    out: Dict[str, Any] = {"status": "success", "untrusted_content": UNTRUSTED_NOTICE,
+                           "session_id": session_id, "state": None, "events": events}
     try:
-        # Generate a task ID
-        task_id = str(uuid.uuid4())
-        
-        # Store the mapping of task_id to agent_url for later reference
-        task_agent_mapping[task_id] = agent_url
-        
-        # Save the task mapping to disk
+        if ctx:
+            await ctx.info("Sending message to agent (streaming)")
+        async for ev in make_client(agent_url).send_streaming_message(message, context_id=session_id):
+            r = render_stream_event(ev, agent_url)
+            events.append(r)
+            if r.get("task_id") and r["task_id"] not in task_agent_mapping:
+                task_agent_mapping[r["task_id"]] = agent_url
+                out["task_id"] = r["task_id"]
+            if r.get("context_id"):
+                out["session_id"] = r["context_id"]
+            if r.get("state"):
+                out["state"] = r["state"]
+            if len(events) >= MAX_STREAM_EVENTS:
+                out["truncated"] = True
+                break
         save_to_json(task_agent_mapping, TASK_AGENT_MAPPING_FILE)
-        
-        # Create the message
-        a2a_message = Message(
-            role="user",
-            parts=[TextPart(text=message)],
-        )
-        
-        if ctx:
-            await ctx.info(f"Sending message to agent (streaming): {message}")
-            
-        # Start progress indication
-        if ctx:
-            await ctx.info("Processing...")
-        
-        # Dictionary to accumulate streaming responses
-        complete_response = {
-            "status": "success",
-            "task_id": task_id,
-            "untrusted_content": UNTRUSTED_NOTICE,
-            "session_id": session_id,
-            "state": "working",
-            "messages": [],
-            "artifacts": [],
-        }
-        
-        # Create payload as a single dictionary
-        payload = {
-            "id": task_id,
-            "message": a2a_message,
-        }
-        if session_id:
-            payload["sessionId"] = session_id
-        
-        # Send the task and subscribe to updates
-        stream = client.send_task_streaming(payload)
-        
-        # Process and report stream events
-        try:
-            all_events = []
-            
-            async for event in stream:
-                # Save all events for debugging
-                all_events.append({
-                    "type": str(type(event)),
-                    "dir": str(dir(event)),
-                })
-                
-                if hasattr(event, "result"):
-                    if hasattr(event.result, "status"):
-                        # It's a TaskStatusUpdateEvent
-                        status_event = event.result
-                        
-                        # Update the state
-                        if hasattr(status_event, "status") and hasattr(status_event.status, "state"):
-                            complete_response["state"] = status_event.status.state
-                        
-                        # Extract any message
-                        if hasattr(status_event, "status") and hasattr(status_event.status, "message") and status_event.status.message:
-                            message_text = ""
-                            for part in status_event.status.message.parts:
-                                if part.type == "text":
-                                    message_text += part.text
-                            
-                            if message_text:
-                                message_text = wrap_untrusted_text(message_text, agent_url)
-                                complete_response["messages"].append(message_text)
-                                if ctx:
-                                    await ctx.info("Agent sent a message")
-                        
-                        # If this is the final event, set session ID
-                        if hasattr(status_event, "final") and status_event.final:
-                            complete_response["session_id"] = getattr(status_event, "sessionId", session_id)
-                        
-                    elif hasattr(event.result, "artifact"):
-                        # It's a TaskArtifactUpdateEvent
-                        artifact_event = event.result
-                        
-                        # Extract artifact content
-                        artifact_data = {
-                            "name": wrap_untrusted_text(artifact_event.artifact.name if hasattr(artifact_event.artifact, "name") else "unnamed", agent_url),
-                            "contents": [],
-                        }
-                        
-                        for part in artifact_event.artifact.parts:
-                            if part.type == "text":
-                                artifact_data["contents"].append({
-                                    "type": "text",
-                                    "text": wrap_untrusted_text(part.text, agent_url),
-                                })
-                            elif part.type == "data":
-                                artifact_data["contents"].append({
-                                    "type": "data",
-                                    "data": wrap_untrusted_data(part.data, agent_url),
-                                })
-                        
-                        complete_response["artifacts"].append(artifact_data)
-                        
-                        if ctx:
-                            await ctx.info(f"Received artifact: {artifact_data['name']}")
-                else:
-                    # Unknown event type, try to extract what we can
-                    complete_response["unknown_events"] = complete_response.get("unknown_events", []) + [
-                        {
-                            "type": str(type(event)),
-                            "dir": str(dir(event))
-                        }
-                    ]
-            
-            # Include debug info            
-            complete_response["_debug_info"] = {
-                "all_events": all_events
-            }
-            
-            return complete_response
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": f"Error processing stream events: {str(e)}",
-                "_debug_info": {
-                    "all_events": all_events
-                }
-            }
-            
+        return out
     except Exception as e:
-        return {
-            "status": "error",
-            "message": f"Error sending message (stream): {str(e)}",
-        }
+        out.update(status="error", message=f"Error sending message (stream): {error_text(e, agent_url)}")
+        return out
 
 
 class CustomA2AServer:

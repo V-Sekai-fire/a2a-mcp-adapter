@@ -378,6 +378,18 @@ The server exposes the following MCP tools for integration with LLMs like Claude
   }
   ```
 
+## A2A protocol version
+
+The MCP tools (`register_agent`, `send_message`, `send_message_stream`, `get_task_result`,
+`cancel_task`) speak A2A v1.0 over the JSON-RPC binding: PascalCase methods (`SendMessage`,
+`SendStreamingMessage`, `GetTask`, `CancelTask`), an `A2A-Version: 1.0` header, `contextId`
+(the tool parameter `session_id` maps to it), ProtoJSON enums (`ROLE_USER`, `TASK_STATE_*`) and
+parts without a `kind` field. Agents are discovered at `/.well-known/agent-card.json` and must
+list a `JSONRPC` interface with protocol version 1.x in `supportedInterfaces`; the interface URL
+goes through the same SSRF guard as the registered URL. Agents that only speak the old
+`tasks/send` dialect are no longer supported by the tools. The bridge's own A2A server side
+(`setup_a2a_server`) is unchanged and still uses the old dialect.
+
 ## Untrusted agent replies (prompt injection)
 
 Registration is gated, but a registered agent can still be compromised or hostile. Every string
