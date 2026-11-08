@@ -14,44 +14,17 @@ Configure the transport type using the MCP_TRANSPORT environment variable.
 
 import asyncio
 import os
-import uuid
-from typing import Any, AsyncGenerator, Dict, List, Optional, Union
-import json
+from typing import Any, Dict, List, Optional
 import logging
 import atexit
 
-import httpx
 # Set required environment variable for FastMCP 2.8.1+
 os.environ.setdefault('FASTMCP_LOG_LEVEL', 'INFO')
 from fastmcp import Context, FastMCP
 from pydantic import BaseModel, Field
 
-from common.types import (
-    AgentCard,
-    AgentCapabilities,
-    AgentSkill,
-    Artifact,
-    DataPart,
-    Message,
-    Part,
-    TextPart,
-    TaskState,
-    TaskStatus,
-    TaskStatusUpdateEvent,
-    TaskArtifactUpdateEvent,
-    JSONRPCResponse,
-    SendTaskRequest,
-    SendTaskResponse,
-    SendTaskStreamingRequest,
-    SendTaskStreamingResponse,
-    GetTaskRequest,
-    GetTaskResponse,
-    TaskQueryParams,
-    CancelTaskRequest, 
-    CancelTaskResponse
-)
-from common.client.client import A2AClient
-from common.server.task_manager import InMemoryTaskManager
+from common.server.server import A2AServer
+from common.server.task_manager import BridgeTaskManager
 from persistence_utils import save_to_json, load_from_json
 from a2a_v1 import (
     A2AError,
@@ -67,10 +40,7 @@ from a2a_v1 import (
 from security import (
     BearerAuthMiddleware,
     UNTRUSTED_NOTICE,
-    UnsafeURLError,
     require_auth_for_host,
-    wrap_untrusted_data,
-    wrap_untrusted_text,
     validate_agent_url,
 )
 
@@ -141,144 +111,6 @@ class AgentInfo(BaseModel):
     url: str = Field(description="URL of the A2A agent")
     name: str = Field(description="Name of the A2A agent")
     description: str = Field(description="Description of the A2A agent")
-
-class A2ABridgeTaskManager(InMemoryTaskManager):
-    """Task manager that forwards tasks to A2A agents."""
-    
-    def __init__(self):
-        super().__init__()
-        self.agent_clients = {}  # Maps agent URLs to A2AClient instances
-        
-    def get_or_create_client(self, agent_url: str) -> A2AClient:
-        """Get an existing client or create a new one."""
-        if agent_url not in self.agent_clients:
-            self.agent_clients[agent_url] = A2AClient(url=agent_url)  # Use named parameter
-        return self.agent_clients[agent_url]
-    
-    async def on_send_task(self, request: SendTaskRequest) -> SendTaskResponse:
-        """Handle a task send request by forwarding to the appropriate A2A agent."""
-        task_id = request.params.id
-        # Extract the agent URL from metadata
-        agent_url = request.params.metadata.get("agent_url") if request.params.metadata else None
-        
-        if not agent_url:
-            # No agent URL provided, return error
-            return SendTaskResponse(
-                id=request.id,
-                error={
-                    "code": -32602,
-                    "message": "Agent URL not provided in task metadata",
-                }
-            )
-        
-        client = self.get_or_create_client(agent_url)
-        
-        # Forward the message to the A2A agent
-        try:
-            # Create payload as a single dictionary
-            payload = {
-                "id": task_id,
-                "message": request.params.message,
-            }
-            if request.params.sessionId:
-                payload["sessionId"] = request.params.sessionId
-            if request.params.metadata:
-                payload["metadata"] = request.params.metadata
-                
-            result = await client.send_task(payload)
-            
-            # Store the task result
-            self.tasks[task_id] = result
-            
-            # Return the response
-            return SendTaskResponse(id=request.id, result=result)
-        except Exception as e:
-            return SendTaskResponse(
-                id=request.id,
-                error={
-                    "code": -32603,
-                    "message": f"Error forwarding task to A2A agent: {str(e)}",
-                }
-            )
-    
-    async def on_send_task_subscribe(
-        self, request: SendTaskStreamingRequest
-    ) -> AsyncGenerator[SendTaskStreamingResponse, None] | JSONRPCResponse:
-        """Handle a task subscription request by forwarding to the appropriate A2A agent."""
-        task_id = request.params.id
-        # Extract the agent URL from metadata
-        agent_url = request.params.metadata.get("agent_url") if request.params.metadata else None
-        
-        if not agent_url:
-            # No agent URL provided, return error
-            return JSONRPCResponse(
-                id=request.id,
-                error={
-                    "code": -32602,
-                    "message": "Agent URL not provided in task metadata",
-                }
-            )
-        
-        client = self.get_or_create_client(agent_url)
-        
-        # Set up SSE consumer
-        sse_event_queue = await self.setup_sse_consumer(task_id=task_id)
-        
-        # Start forwarding the task in a background task
-        asyncio.create_task(self._forward_task_stream(
-            client=client,
-            request=request,
-            task_id=task_id,
-        ))
-        
-        # Return the SSE consumer
-        return self.dequeue_events_for_sse(
-            request_id=request.id,
-            task_id=task_id,
-            sse_event_queue=sse_event_queue,
-        )
-    
-    async def _forward_task_stream(
-        self, client: A2AClient, request: SendTaskStreamingRequest, task_id: str
-    ):
-        """Forward a task stream to an A2A agent and relay the responses."""
-        try:
-            # Create payload as a single dictionary
-            payload = {
-                "id": task_id,
-                "message": request.params.message,
-            }
-            if request.params.sessionId:
-                payload["sessionId"] = request.params.sessionId
-            if request.params.metadata:
-                payload["metadata"] = request.params.metadata
-                
-            # Send the task and subscribe to updates
-            stream = client.send_task_subscribe(payload)
-            
-            # Process the stream events
-            async for event in stream:
-                # Forward the event to our SSE queue
-                await self.enqueue_events_for_sse(task_id, event)
-                
-                # If this is the final event, break
-                if hasattr(event, "final") and event.final:
-                    break
-                    
-        except Exception as e:
-            # Create an error event and enqueue it
-            error_event = TaskStatusUpdateEvent(
-                id=task_id,
-                status=TaskStatus(
-                    state=TaskState.FAILED,
-                    message=Message(
-                        role="agent",
-                        parts=[TextPart(text=f"Error forwarding task: {str(e)}")],
-                    ),
-                ),
-                final=True,
-            )
-            await self.enqueue_events_for_sse(task_id, error_event)
 
 async def fetch_agent_card(url: str) -> Dict[str, Any]:
     """Fetch and validate a v1.0 agent card (SSRF-guarded); raises ValueError."""
@@ -531,79 +363,40 @@ async def send_message_stream(
         return out
 
 
-class CustomA2AServer:
-    """
-    A minimal A2A server implementation that uses the task manager.
-    """
-    
-    def __init__(
-        self,
-        agent_card: AgentCard,
-        task_manager: A2ABridgeTaskManager,
-        host: str = "127.0.0.1",
-        port: int = 41241,
-    ):
-        self.agent_card = agent_card
-        self.task_manager = task_manager
-        self.host = host
-        self.port = port
-        
-    async def start_async(self):
-        """Start the A2A server asynchronously."""
-        # In a real implementation, this would start a FastAPI server
-        # For now, just log that it's "started"
-        print(f"A2A server 'started' at {self.host}:{self.port}")
-        # Keep the server "running"
-        while True:
-            await asyncio.sleep(3600)  # Sleep for an hour
-    
-    def start(self):
-        """Start the A2A server."""
-        asyncio.create_task(self.start_async())
+def build_agent_card(token_required: bool) -> Dict[str, Any]:
+    """The bridge's v1.0 agent card."""
+    public = os.environ.get("A2A_PUBLIC_URL") or f"http://{A2A_HOST}:{A2A_PORT}/"
+    card: Dict[str, Any] = {
+        "name": "MCP Bridge Agent",
+        "description": "A bridge between MCP and A2A protocols. Send a message with "
+                       "metadata.agent_url naming a registered agent to forward it.",
+        "version": "0.2.0",
+        "supportedInterfaces": [{"url": public, "protocolBinding": "JSONRPC", "protocolVersion": "1.0"}],
+        "capabilities": {"streaming": True, "pushNotifications": False, "extendedAgentCard": False},
+        "defaultInputModes": ["text/plain"],
+        "defaultOutputModes": ["text/plain", "application/json"],
+        "skills": [{
+            "id": "mcp-bridge",
+            "name": "MCP Bridge",
+            "description": "Forwards messages to registered A2A agents",
+            "tags": ["bridge", "proxy", "mcp", "a2a"],
+        }],
+    }
+    if token_required:
+        card["securitySchemes"] = {"bearer": {"httpAuthSecurityScheme": {"scheme": "Bearer"}}}
+        card["securityRequirements"] = [{"schemes": {"bearer": {"list": []}}}]
+    return card
 
 
-def setup_a2a_server():
-    """Set up the A2A server with our task manager."""
-    # Create a sample agent card
-    agent_card = AgentCard(
-        name="MCP Bridge Agent",
-        description="A bridge between MCP and A2A protocols",
-        url=f"http://{A2A_HOST}:{A2A_PORT}",
-        version="0.1.0",
-        # Add the required capabilities field
-        capabilities=AgentCapabilities(
-            streaming=True,
-            pushNotifications=False,
-            stateTransitionHistory=False,
-        ),
-        # Add the required skills field with at least one skill
-        skills=[
-            AgentSkill(
-                id="mcp-bridge",
-                name="MCP Bridge",
-                description="Allows MCP clients to communicate with A2A agents",
-                tags=["bridge", "proxy", "mcp", "a2a"],
-                examples=[
-                    "Send a message to an A2A agent",
-                    "Register an A2A agent with the bridge",
-                    "List all registered A2A agents",
-                ],
-                inputModes=["text/plain"],
-                outputModes=["text/plain", "application/json"],
-            )
-        ],
-    )
-    
-    # Create our custom task manager
-    task_manager = A2ABridgeTaskManager()
-    
-    # Create and return the A2A server
-    return CustomA2AServer(
-        agent_card=agent_card,
-        task_manager=task_manager,
-        host=A2A_HOST,
-        port=A2A_PORT,
-    )
+def a2a_server_enabled() -> bool:
+    return os.environ.get("A2A_SERVER", "").lower() in ("1", "true", "yes")
+
+
+def setup_a2a_server() -> A2AServer:
+    """Build the A2A v1.0 server; it only listens when A2A_SERVER=1."""
+    token = require_auth_for_host(A2A_HOST, "A2A listener")
+    manager = BridgeTaskManager(is_registered=lambda url: url in registered_agents)
+    return A2AServer(manager, build_agent_card(bool(token)), host=A2A_HOST, port=A2A_PORT, token=token)
 
 
 def _auth_middleware():
@@ -625,8 +418,10 @@ async def main_async():
     asyncio.create_task(periodic_save())
     
     # Set up and start the A2A server
-    a2a_server = setup_a2a_server()
-    a2a_task = asyncio.create_task(a2a_server.start_async())
+    if a2a_server_enabled():
+        a2a_task = asyncio.create_task(setup_a2a_server().start_async())
+    else:
+        a2a_task = None
     
     # Start the MCP server with the configured transport
     print(f"Starting MCP server with {MCP_TRANSPORT} transport...")
@@ -662,7 +457,7 @@ async def main_async():
         )
     
     # Run both servers
-    await asyncio.gather(a2a_task, mcp_task)
+    await asyncio.gather(*[t for t in (a2a_task, mcp_task) if t is not None])
 
 
 def load_registered_agents():

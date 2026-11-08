@@ -96,12 +96,13 @@ class BearerAuthMiddleware:
     Pass-through when token is None (loopback-only binds).
     """
 
-    def __init__(self, app, token: Optional[str] = None):
+    def __init__(self, app, token: Optional[str] = None, exempt_paths=()):
         self.app = app
         self.token = token
+        self.exempt_paths = tuple(exempt_paths)
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or not self.token:
+        if scope["type"] != "http" or not self.token or scope.get("path") in self.exempt_paths:
             await self.app(scope, receive, send)
             return
         supplied = ""

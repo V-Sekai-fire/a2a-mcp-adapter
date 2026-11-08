@@ -1,137 +1,151 @@
+"""A2A v1.0 server (JSON-RPC binding), https://a2a-protocol.org/latest/specification/ (1.0.0).
+
+Methods: SendMessage, SendStreamingMessage, GetTask, ListTasks, CancelTask, SubscribeToTask.
+Push-notification config methods and GetExtendedAgentCard answer the spec's
+"not supported" errors. The agent card at /.well-known/agent-card.json is public; the
+JSON-RPC endpoint needs the bearer token when one is configured.
+"""
 import json
 import logging
+from typing import Any, AsyncIterator, Dict, Optional
 
-from collections.abc import AsyncIterable
-from typing import Any
-
-from pydantic import ValidationError
-from sse_starlette.sse import EventSourceResponse
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, StreamingResponse
+from starlette.routing import Route
 
-from common.server.task_manager import TaskManager
-from common.types import (
-    A2ARequest,
-    AgentCard,
-    CancelTaskRequest,
-    GetTaskPushNotificationRequest,
-    GetTaskRequest,
-    InternalError,
-    InvalidRequestError,
-    JSONParseError,
-    JSONRPCResponse,
-    SendTaskRequest,
-    SendTaskStreamingRequest,
-    SetTaskPushNotificationRequest,
-    TaskResubscriptionRequest,
-)
-
+from security import BearerAuthMiddleware
 
 logger = logging.getLogger(__name__)
 
+CARD_PATH = "/.well-known/agent-card.json"
+SUPPORTED_MAJOR = "1"
+MAX_BODY = 8 * 1024 * 1024
+
+UNARY = {
+    "SendMessage": "send_message",
+    "GetTask": "get_task",
+    "ListTasks": "list_tasks",
+    "CancelTask": "cancel_task",
+}
+STREAMING = {
+    "SendStreamingMessage": "send_streaming_message",
+    "SubscribeToTask": "subscribe_to_task",
+}
+PUSH_CONFIG = {
+    "CreateTaskPushNotificationConfig",
+    "GetTaskPushNotificationConfig",
+    "ListTaskPushNotificationConfigs",
+    "DeleteTaskPushNotificationConfig",
+}
+
+
+class RpcError(Exception):
+    def __init__(self, code: int, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _error_body(rid, e: RpcError) -> Dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": rid, "error": {"code": e.code, "message": e.message}}
+
+
+async def _read_body(request: Request) -> bytes:
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > MAX_BODY:
+        raise RpcError(-32600, "Request too large")
+    buf = bytearray()
+    async for chunk in request.stream():
+        buf += chunk
+        if len(buf) > MAX_BODY:
+            raise RpcError(-32600, "Request too large")
+    return bytes(buf)
+
+
+def _check_version(request: Request) -> None:
+    # A missing header means a 0.3 client (spec 3.6.1); this server speaks 1.x only.
+    version = request.headers.get("a2a-version", "").strip()
+    if version.split(".")[0] != SUPPORTED_MAJOR:
+        raise RpcError(-32009, "Unsupported A2A version; this agent supports 1.0")
+
 
 class A2AServer:
-    def __init__(
-        self,
-        host='127.0.0.1',
-        port=5000,
-        endpoint='/',
-        agent_card: AgentCard = None,
-        task_manager: TaskManager = None,
-    ):
+    def __init__(self, handler, card: Dict[str, Any], host: str = "127.0.0.1",
+                 port: int = 41241, token: Optional[str] = None):
+        self.handler = handler
+        self.card = card
         self.host = host
         self.port = port
-        self.endpoint = endpoint
-        self.task_manager = task_manager
-        self.agent_card = agent_card
-        self.app = Starlette()
-        self.app.add_route(
-            self.endpoint, self._process_request, methods=['POST']
-        )
-        self.app.add_route(
-            '/.well-known/agent.json', self._get_agent_card, methods=['GET']
-        )
+        inner = Starlette(routes=[
+            Route(CARD_PATH, self._card, methods=["GET"]),
+            Route("/", self._rpc, methods=["POST"]),
+        ])
+        # The card is public so clients can discover the bearer scheme.
+        self.app = BearerAuthMiddleware(inner, token=token, exempt_paths=(CARD_PATH,))
 
-    def start(self):
-        if self.agent_card is None:
-            raise ValueError('agent_card is not defined')
-
-        if self.task_manager is None:
-            raise ValueError('request_handler is not defined')
-
+    async def start_async(self) -> None:
         import uvicorn
+        await uvicorn.Server(uvicorn.Config(self.app, host=self.host, port=self.port,
+                                            log_level="info")).serve()
 
-        uvicorn.run(self.app, host=self.host, port=self.port)
+    async def _card(self, request: Request) -> JSONResponse:
+        return JSONResponse(self.card)
 
-    def _get_agent_card(self, request: Request) -> JSONResponse:
-        return JSONResponse(self.agent_card.model_dump(exclude_none=True))
-
-    async def _process_request(self, request: Request):
+    async def _rpc(self, request: Request):
+        rid = None
         try:
-            body = await request.json()
-            json_rpc_request = A2ARequest.validate_python(body)
+            raw = await _read_body(request)
+            try:
+                body = json.loads(raw)
+            except (ValueError, UnicodeDecodeError):
+                raise RpcError(-32700, "Invalid JSON payload")
+            if not isinstance(body, dict) or body.get("jsonrpc") != "2.0" or not isinstance(body.get("method"), str):
+                raise RpcError(-32600, "Request payload validation error")
+            candidate = body.get("id")
+            if isinstance(candidate, (str, int)) and not isinstance(candidate, bool):
+                rid = candidate
+            _check_version(request)
+            method = body["method"]
+            params = body.get("params", {})
+            if method in UNARY:
+                result = await getattr(self.handler, UNARY[method])(params)
+                return JSONResponse({"jsonrpc": "2.0", "id": rid, "result": result})
+            if method in STREAMING:
+                return await self._stream(rid, getattr(self.handler, STREAMING[method])(params))
+            if method in PUSH_CONFIG:
+                raise RpcError(-32003, "Push notifications are not supported")
+            if method == "GetExtendedAgentCard":
+                raise RpcError(-32004, "Extended agent card is not supported")
+            raise RpcError(-32601, "Method not found")
+        except RpcError as e:
+            return JSONResponse(_error_body(rid, e))
+        except Exception:
+            logger.exception("unhandled error in JSON-RPC handler")
+            return JSONResponse(_error_body(rid, RpcError(-32603, "Internal error")))
 
-            if isinstance(json_rpc_request, GetTaskRequest):
-                result = await self.task_manager.on_get_task(json_rpc_request)
-            elif isinstance(json_rpc_request, SendTaskRequest):
-                result = await self.task_manager.on_send_task(json_rpc_request)
-            elif isinstance(json_rpc_request, SendTaskStreamingRequest):
-                result = await self.task_manager.on_send_task_subscribe(
-                    json_rpc_request
-                )
-            elif isinstance(json_rpc_request, CancelTaskRequest):
-                result = await self.task_manager.on_cancel_task(
-                    json_rpc_request
-                )
-            elif isinstance(json_rpc_request, SetTaskPushNotificationRequest):
-                result = await self.task_manager.on_set_task_push_notification(
-                    json_rpc_request
-                )
-            elif isinstance(json_rpc_request, GetTaskPushNotificationRequest):
-                result = await self.task_manager.on_get_task_push_notification(
-                    json_rpc_request
-                )
-            elif isinstance(json_rpc_request, TaskResubscriptionRequest):
-                result = await self.task_manager.on_resubscribe_to_task(
-                    json_rpc_request
-                )
-            else:
-                logger.warning(
-                    f'Unexpected request type: {type(json_rpc_request)}'
-                )
-                raise ValueError(f'Unexpected request type: {type(request)}')
+    async def _stream(self, rid, events: AsyncIterator[Dict[str, Any]]):
+        it = events.__aiter__()
+        # Pull the first event now so setup errors become a plain JSON-RPC error.
+        try:
+            first = await it.__anext__()
+        except StopAsyncIteration:
+            first = None
 
-            return self._create_response(result)
+        def frame(payload: Dict[str, Any]) -> str:
+            return "data: " + json.dumps(payload) + "\n\n"
 
-        except Exception as e:
-            return self._handle_exception(e)
+        async def body():
+            try:
+                if first is not None:
+                    yield frame({"jsonrpc": "2.0", "id": rid, "result": first})
+                async for ev in it:
+                    yield frame({"jsonrpc": "2.0", "id": rid, "result": ev})
+            except RpcError as e:
+                yield frame(_error_body(rid, e))
+            except Exception:
+                logger.exception("unhandled error in stream")
+                yield frame(_error_body(rid, RpcError(-32603, "Internal error")))
 
-    def _handle_exception(self, e: Exception) -> JSONResponse:
-        if isinstance(e, json.decoder.JSONDecodeError):
-            json_rpc_error = JSONParseError()
-        elif isinstance(e, ValidationError):
-            json_rpc_error = InvalidRequestError(data=json.loads(e.json()))
-        else:
-            logger.error(f'Unhandled exception: {e}')
-            json_rpc_error = InternalError()
-
-        response = JSONRPCResponse(id=None, error=json_rpc_error)
-        return JSONResponse(
-            response.model_dump(exclude_none=True), status_code=400
-        )
-
-    def _create_response(
-        self, result: Any
-    ) -> JSONResponse | EventSourceResponse:
-        if isinstance(result, AsyncIterable):
-
-            async def event_generator(result) -> AsyncIterable[dict[str, str]]:
-                async for item in result:
-                    yield {'data': item.model_dump_json(exclude_none=True)}
-
-            return EventSourceResponse(event_generator(result))
-        if isinstance(result, JSONRPCResponse):
-            return JSONResponse(result.model_dump(exclude_none=True))
-        logger.error(f'Unexpected result type: {type(result)}')
-        raise ValueError(f'Unexpected result type: {type(result)}')
+        return StreamingResponse(body(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache"})
