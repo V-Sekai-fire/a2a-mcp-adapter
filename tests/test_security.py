@@ -1,8 +1,17 @@
-import asyncio, os, sys
+import asyncio
+import os
+import sys
+
 import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from security import (BearerAuthMiddleware, UnsafeURLError, require_auth_for_host, validate_agent_url)
-import persistence_utils as pu
+import persistence_utils as pu  # noqa: E402
+from security import (  # noqa: E402
+    BearerAuthMiddleware,
+    UnsafeURLError,
+    require_auth_for_host,
+    validate_agent_url,
+)
 
 @pytest.mark.parametrize("url", [
     "http://169.254.169.254/latest/meta-data", "http://127.0.0.1:8080", "http://localhost/",
@@ -46,5 +55,7 @@ def test_persistence(tmp_path):
     assert pu.save_to_json({"a": 1}, f)
     assert oct(os.stat(f).st_mode & 0o777) == "0o600"
     assert pu.load_from_json(f) == {"a": 1}
-    open(f, "w").write("[1]"); assert pu.load_from_json(f) == {}
-    open(f, "w").write("x" * (pu.MAX_FILE_BYTES + 1)); assert pu.load_from_json(f) == {}
+    open(f, "w").write("[1]")
+    assert pu.load_from_json(f) == {}
+    open(f, "w").write("x" * (pu.MAX_FILE_BYTES + 1))
+    assert pu.load_from_json(f) == {}

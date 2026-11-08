@@ -13,4 +13,4 @@ wheels/
 
 .env
 
-**.cache
+**.cacheuv.lock
