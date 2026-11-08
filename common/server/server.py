@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 class A2AServer:
     def __init__(
         self,
-        host='0.0.0.0',
+        host='127.0.0.1',
         port=5000,
         endpoint='/',
         agent_card: AgentCard = None,

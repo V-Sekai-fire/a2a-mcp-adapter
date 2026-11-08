@@ -53,6 +53,12 @@ from common.types import (
 from common.client.client import A2AClient
 from common.server.task_manager import InMemoryTaskManager
 from persistence_utils import save_to_json, load_from_json
+from security import (
+    BearerAuthMiddleware,
+    UnsafeURLError,
+    require_auth_for_host,
+    validate_agent_url,
+)
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -66,6 +72,7 @@ DATA_DIR = os.environ.get("A2A_MCP_DATA_DIR", ".")
 REGISTERED_AGENTS_FILE = os.path.join(DATA_DIR, "registered_agents.json")
 TASK_AGENT_MAPPING_FILE = os.path.join(DATA_DIR, "task_agent_mapping.json")
 
+MAX_PERSISTED_AGENTS = 1000
 # Load stored data from disk if it exists
 stored_agents = load_from_json(REGISTERED_AGENTS_FILE)
 stored_tasks = load_from_json(TASK_AGENT_MAPPING_FILE)
@@ -101,13 +108,13 @@ TRANSPORT_TYPES = ["stdio", "streamable-http", "sse"]
 
 # MCP server configuration
 MCP_TRANSPORT = os.environ.get("MCP_TRANSPORT", DEFAULT_TRANSPORT).lower()
-MCP_HOST = os.environ.get("MCP_HOST", "0.0.0.0")
+MCP_HOST = os.environ.get("MCP_HOST", "127.0.0.1")
 MCP_PORT = int(os.environ.get("MCP_PORT", "8000"))
 MCP_PATH = os.environ.get("MCP_PATH", "/mcp")  # For streamable-http
 MCP_SSE_PATH = os.environ.get("MCP_SSE_PATH", "/sse")  # For sse
 
 # A2A server configuration
-A2A_HOST = os.environ.get("A2A_HOST", "0.0.0.0")
+A2A_HOST = os.environ.get("A2A_HOST", "127.0.0.1")
 A2A_PORT = int(os.environ.get("A2A_PORT", "41241"))
 
 # Validate transport type
@@ -264,7 +271,12 @@ async def fetch_agent_card(url: str) -> AgentCard:
     Fetch the agent card from the agent's URL.
     First try the main URL, then the well-known location.
     """
-    async with httpx.AsyncClient() as client:
+    try:
+        url = await asyncio.to_thread(validate_agent_url, url)
+    except UnsafeURLError as e:
+        raise ValueError(f"Refusing to fetch agent card: {e}")
+    # follow_redirects stays off so a public host cannot bounce us to an internal one
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
         # First try the main endpoint
         try:
             response = await client.get(url)
@@ -924,7 +936,7 @@ class CustomA2AServer:
         self,
         agent_card: AgentCard,
         task_manager: A2ABridgeTaskManager,
-        host: str = "0.0.0.0",
+        host: str = "127.0.0.1",
         port: int = 41241,
     ):
         self.agent_card = agent_card
@@ -990,6 +1002,14 @@ def setup_a2a_server():
     )
 
 
+def _auth_middleware():
+    """Bearer-auth middleware list for HTTP transports; refuses open non-loopback binds."""
+    from starlette.middleware import Middleware
+
+    token = require_auth_for_host(MCP_HOST, "MCP HTTP listener")
+    return [Middleware(BearerAuthMiddleware, token=token)] if token else []
+
+
 async def main_async():
     """
     Main async function to start both the MCP and A2A servers.
@@ -1014,22 +1034,26 @@ async def main_async():
         )
     elif MCP_TRANSPORT == "streamable-http":
         # Use streamable-http transport
+        auth_middleware = _auth_middleware()
         mcp_task = asyncio.create_task(
             mcp.run_async(
                 transport="streamable-http",
                 host=MCP_HOST,
                 port=MCP_PORT,
                 path=MCP_PATH,
+                middleware=auth_middleware,
             )
         )
     elif MCP_TRANSPORT == "sse":
         # Use sse transport (deprecated but still supported)
+        auth_middleware = _auth_middleware()
         mcp_task = asyncio.create_task(
             mcp.run_async(
                 transport="sse",
                 host=MCP_HOST,
                 port=MCP_PORT,
                 path=MCP_SSE_PATH,
+                middleware=auth_middleware,
             )
         )
     
@@ -1045,8 +1069,12 @@ def load_registered_agents():
     
     # Load agents data
     agents_data = load_from_json(REGISTERED_AGENTS_FILE)
-    for url, agent_data in agents_data.items():
-        registered_agents[url] = AgentInfo(**agent_data)
+    for url, agent_data in list(agents_data.items())[:MAX_PERSISTED_AGENTS]:
+        try:
+            validate_agent_url(url)
+            registered_agents[url] = AgentInfo(**agent_data)
+        except Exception as e:  # unsafe URL or malformed record: drop it
+            logger.warning(f"Dropping persisted agent {url!r}: {e}")
     
     # Load task mappings
     task_agent_mapping = load_from_json(TASK_AGENT_MAPPING_FILE)
