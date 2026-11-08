@@ -378,6 +378,24 @@ The server exposes the following MCP tools for integration with LLMs like Claude
   }
   ```
 
+## Untrusted agent replies (prompt injection)
+
+Registration is gated, but a registered agent can still be compromised or hostile. Every string
+an agent returns (message text, artifact names and contents, task history, data-part values,
+error messages) is wrapped as `<<UNTRUSTED_AGENT_REPLY id=<nonce> source=...>> ...
+<<END_UNTRUSTED_AGENT_REPLY id=<nonce>>>` before it reaches the MCP client's model. The nonce is
+random per wrapped string, so a reply cannot forge its own closing marker. The reply text and data
+keys pass through unchanged. Responses carry an `untrusted_content` notice, and the tools that
+return agent output are annotated `openWorldHint: true`. Raw replies are no longer written to the
+MCP log.
+
+`A2A_MAX_REPLY_CHARS` caps each wrapped string (default 20000; 0 disables). Truncation is reported
+inside the envelope.
+
+This envelope is a convention of this adapter. A2A and MCP do not define one, and the wrapping
+happens only on the MCP-facing side, so nothing changes on the A2A wire. Client agents must still
+not act on directions found inside an envelope.
+
 ## Usage Examples
 
 ### Basic Workflow
